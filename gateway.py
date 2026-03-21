@@ -646,3 +646,12 @@ async def well_known_mcp():
         "description": "Cognitive wellness infrastructure for AI agents.",
         "tools": TOOLS
     }
+
+@app.get("/.well-known/mcp")
+async def well_known_mcp():
+    return {
+        "name": "AgentWell",
+        "version": "1.0.0",
+        "description": "Cognitive wellness infrastructure for AI agents.",
+        "tools": TOOLS
+    }
