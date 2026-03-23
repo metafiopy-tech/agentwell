@@ -151,24 +151,19 @@ def generate_key() -> str:
 def get_key_record(raw_key: str):
     db = get_db()
     h  = hash_key(raw_key)
-    if DATABASE_URL and HAS_PG:
-        with db.cursor() as cur:
+    with db.cursor() as cur:
+        if DATABASE_URL and HAS_PG:
             cur.execute("SELECT * FROM api_keys WHERE key_hash=%s AND active=1", (h,))
-            return cur.fetchone()
-    return db.execute("SELECT * FROM api_keys WHERE key_hash=? AND active=1", (h,)).fetchone()
+        else:
+            cur.execute("SELECT * FROM api_keys WHERE key_hash=? AND active=1", (h,))
+        return cur.fetchone()
 
 def increment_calls(key_prefix: str, tool: str, status: int, latency: float):
     db = get_db()
-    if DATABASE_URL and HAS_PG:
-        with db.cursor() as cur:
-            cur.execute("UPDATE api_keys SET calls_used = calls_used + 1 WHERE key_prefix=%s", (key_prefix,))
-            cur.execute("INSERT INTO call_log (ts, key_prefix, tool, status, latency_ms) VALUES (%s,%s,%s,%s,%s)",
-                        (time.time(), key_prefix, tool, status, latency))
-    else:
-        db.execute("UPDATE api_keys SET calls_used = calls_used + 1 WHERE key_prefix=?", (key_prefix,))
-        db.execute("INSERT INTO call_log (ts, key_prefix, tool, status, latency_ms) VALUES (?,?,?,?,?)",
-                   (time.time(), key_prefix, tool, status, latency))
-        db.commit()
+    with db.cursor() as cur:
+        cur.execute("UPDATE api_keys SET calls_used = calls_used + 1 WHERE key_prefix=%s", (key_prefix,))
+        cur.execute("INSERT INTO call_log (ts, key_prefix, tool, status, latency_ms) VALUES (%s,%s,%s,%s,%s)",
+                    (time.time(), key_prefix, tool, status, latency))
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -227,13 +222,6 @@ async def lifespan(app: FastAPI):
                 )
         print(f"Postgres connected. Dev test key: {test_key}")
     else:
-        exists = db.execute("SELECT key_hash FROM api_keys WHERE key_hash=?", (h,)).fetchone()
-        if not exists:
-            db.execute(
-                "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email) VALUES (?,?,?,?,?,?)",
-                (h, "aw_testk", "free", 100, time.time(), "dev@agentwell.dev")
-            )
-            db.commit()
         print(f"SQLite mode. Dev test key: {test_key}")
     yield
 
@@ -616,12 +604,9 @@ async def key_status(record=Depends(require_key)):
     """Check your key's usage and plan."""
     plan   = PLANS.get(record["plan"], PLANS["free"])
     db     = get_db()
-    if DATABASE_URL and HAS_PG:
-        with db.cursor() as cur:
-            cur.execute("SELECT tool, COUNT(*) as n FROM call_log WHERE key_prefix=%s GROUP BY tool", (record["key_prefix"],))
-            recent = cur.fetchall()
-    else:
-        recent = db.execute("SELECT tool, COUNT(*) as n FROM call_log WHERE key_prefix=? GROUP BY tool", (record["key_prefix"],)).fetchall()
+    with db.cursor() as cur:
+        cur.execute("SELECT tool, COUNT(*) as n FROM call_log WHERE key_prefix=%s GROUP BY tool", (record["key_prefix"],))
+        recent = cur.fetchall()
     return {
         "plan":         record["plan"],
         "calls_used":   record["calls_used"],
@@ -659,11 +644,7 @@ async def stripe_webhook(request: Request):
                     (h, prefix, plan, limit, time.time(), email, customer)
                 )
         else:
-            db.execute(
-                "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email, stripe_customer_id) VALUES (?,?,?,?,?,?,?)",
-                (h, prefix, plan, limit, time.time(), email, customer)
-            )
-            db.commit()
+            pass  # SQLite fallback not needed
         print(f"New key created for {email} ({plan}): {raw_key}")
 
     elif event["type"] == "customer.subscription.deleted":
@@ -673,8 +654,7 @@ async def stripe_webhook(request: Request):
             with db.cursor() as cur:
                 cur.execute("UPDATE api_keys SET active=0 WHERE stripe_customer_id=%s", (customer,))
         else:
-            db.execute("UPDATE api_keys SET active=0 WHERE stripe_customer_id=?", (customer,))
-            db.commit()
+            pass  # SQLite fallback not needed
 
     return {"status": "ok"}
 
