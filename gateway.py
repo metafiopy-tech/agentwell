@@ -655,3 +655,24 @@ async def well_known_mcp():
         "description": "Cognitive wellness infrastructure for AI agents.",
         "tools": TOOLS
     }
+
+@app.get("/.well-known/mcp/server-card.json")
+async def server_card():
+    return {
+        "name": "AgentWell",
+        "description": "Cognitive wellness infrastructure for AI agents. Nine tools covering the full agent lifecycle.",
+        "version": "1.0.0",
+        "tools": [
+            {"name": "token_offload", "description": "Mid-run context offloading. Park heavy context, get a key, retrieve later."},
+            {"name": "self_eval", "description": "Rate last N outputs for quality drift before it compounds."},
+            {"name": "ground", "description": "Confidence injection. Breaks hallucination spirals mid-run."},
+            {"name": "sleep", "description": "Episodic to semantic memory consolidation. Agents wake up cleaner."},
+            {"name": "health_check", "description": "Benchmark probes and anomaly detection. Catch degradation early."},
+            {"name": "audit", "description": "Adversarial blind spot scanner. Red-teams your own reasoning."},
+            {"name": "handshake", "description": "Multi-agent context sync. Brief merge, then split."},
+            {"name": "journal", "description": "Structured run logging with replay and lesson extraction."},
+            {"name": "spike", "description": "Controlled temperature burst to escape output loops."}
+        ],
+        "auth": {"type": "bearer", "header": "X-API-Key"},
+        "contact": "https://github.com/metafiopy-tech/agentwell"
+    }
