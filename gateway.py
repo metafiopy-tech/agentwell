@@ -42,7 +42,9 @@ ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 ADMIN_KEY      = os.getenv("AGENTWELL_ADMIN_KEY", "admin-dev-key")
 
-DB_PATH = Path.home() / ".agentwell_gateway.db"
+DATA_DIR = Path(os.getenv("DATA_DIR", str(Path.home())))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH  = DATA_DIR / "agentwell_gateway.db"
 
 PLANS = {
     "payg":    {"calls_per_month": 0,       "price_per_call": 0.002, "monthly_fee": 0},
@@ -310,7 +312,7 @@ _DB_CACHE: dict = {}
 
 def _get_tool_db(name: str):
     if name not in _DB_CACHE:
-        path = Path.home() / f".agentwell_{name}.db"
+        path = DATA_DIR / f"agentwell_{name}.db"
         conn = sqlite3.connect(str(path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         _DB_CACHE[name] = conn
@@ -637,85 +639,3 @@ async def list_tools():
         ],
         "count": len(TOOLS)
     }
-
-@app.get("/.well-known/mcp")
-async def well_known_mcp():
-    return {
-        "name": "AgentWell",
-        "version": "1.0.0",
-        "description": "Cognitive wellness infrastructure for AI agents.",
-        "tools": TOOLS
-    }
-
-@app.get("/.well-known/mcp")
-async def well_known_mcp():
-    return {
-        "name": "AgentWell",
-        "version": "1.0.0",
-        "description": "Cognitive wellness infrastructure for AI agents.",
-        "tools": TOOLS
-    }
-
-@app.get("/.well-known/mcp/server-card.json")
-async def server_card():
-    return {
-        "name": "AgentWell",
-        "description": "Cognitive wellness infrastructure for AI agents. Nine tools covering the full agent lifecycle.",
-        "version": "1.0.0",
-        "tools": [
-            {"name": "token_offload", "description": "Mid-run context offloading. Park heavy context, get a key, retrieve later."},
-            {"name": "self_eval", "description": "Rate last N outputs for quality drift before it compounds."},
-            {"name": "ground", "description": "Confidence injection. Breaks hallucination spirals mid-run."},
-            {"name": "sleep", "description": "Episodic to semantic memory consolidation. Agents wake up cleaner."},
-            {"name": "health_check", "description": "Benchmark probes and anomaly detection. Catch degradation early."},
-            {"name": "audit", "description": "Adversarial blind spot scanner. Red-teams your own reasoning."},
-            {"name": "handshake", "description": "Multi-agent context sync. Brief merge, then split."},
-            {"name": "journal", "description": "Structured run logging with replay and lesson extraction."},
-            {"name": "spike", "description": "Controlled temperature burst to escape output loops."}
-        ],
-        "auth": {"type": "bearer", "header": "X-API-Key"},
-        "contact": "https://github.com/metafiopy-tech/agentwell"
-    }
-
-@app.post("/mcp")
-async def mcp_protocol(request: Request):
-    body = await request.json()
-    method = body.get("method", "")
-    req_id = body.get("id", 1)
-
-    if method == "initialize":
-        return {
-            "jsonrpc": "2.0", "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "AgentWell", "version": "1.0.0"}
-            }
-        }
-
-    if method == "tools/list":
-        return {
-            "jsonrpc": "2.0", "id": req_id,
-            "result": {"tools": [
-                {"name": "token_offload", "description": "Mid-run context offloading. Park heavy context, get a key, retrieve later.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "content": {"type": "string"}, "key": {"type": "string"}}}},
-                {"name": "self_eval", "description": "Rate last N outputs for quality drift before it compounds.", "inputSchema": {"type": "object", "properties": {"outputs": {"type": "array"}, "goal": {"type": "string"}}}},
-                {"name": "ground", "description": "Confidence injection. Breaks hallucination spirals mid-run.", "inputSchema": {"type": "object", "properties": {"context": {"type": "string"}, "symptoms": {"type": "array"}}}},
-                {"name": "sleep", "description": "Episodic to semantic memory consolidation.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "run_id": {"type": "string"}, "content": {"type": "string"}}}},
-                {"name": "health_check", "description": "Benchmark probes and anomaly detection.", "inputSchema": {"type": "object", "properties": {"agent_id": {"type": "string"}}}},
-                {"name": "audit", "description": "Adversarial blind spot scanner. Red-teams your own reasoning.", "inputSchema": {"type": "object", "properties": {"reasoning": {"type": "string"}}}},
-                {"name": "handshake", "description": "Multi-agent context sync.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "token": {"type": "string"}, "agent_id": {"type": "string"}, "context": {"type": "string"}}}},
-                {"name": "journal", "description": "Structured run logging with replay and lesson extraction.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "run_id": {"type": "string"}, "content": {"type": "string"}}}},
-                {"name": "spike", "description": "Controlled temperature burst to escape output loops.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "prompt": {"type": "string"}, "intensity": {"type": "string"}}}}
-            ]}
-        }
-
-    if method == "tools/call":
-        tool = body.get("params", {}).get("name", "")
-        params = body.get("params", {}).get("arguments", {})
-        try:
-            result = await _dispatch(tool, params)
-            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
-        except Exception as e:
-            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}}
-
-    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
