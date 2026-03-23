@@ -21,6 +21,12 @@ import uuid
 import json
 import sqlite3
 import hashlib
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PG = True
+except ImportError:
+    HAS_PG = False
 import threading
 from pathlib import Path
 from typing import Optional
@@ -41,6 +47,7 @@ stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 ADMIN_KEY      = os.getenv("AGENTWELL_ADMIN_KEY", "admin-dev-key")
+DATABASE_URL   = os.getenv("DATABASE_URL", "")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path.home())))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,8 +68,50 @@ TOOLS = [
 # ── DB ────────────────────────────────────────────────────────────────────────
 
 _local = threading.local()
+_pg_conn = None
+_pg_lock = threading.Lock()
 
 def get_db():
+    """Returns a Postgres connection if DATABASE_URL set, else SQLite fallback."""
+    global _pg_conn
+    if DATABASE_URL and HAS_PG:
+        with _pg_lock:
+            try:
+                if _pg_conn is None or _pg_conn.closed:
+                    raise Exception("reconnect")
+                _pg_conn.isolation_level  # ping
+            except Exception:
+                _pg_conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+                _pg_conn.autocommit = True
+                with _pg_conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS api_keys (
+                            key_hash           TEXT PRIMARY KEY,
+                            key_prefix         TEXT NOT NULL,
+                            plan               TEXT DEFAULT 'free',
+                            calls_used         INTEGER DEFAULT 0,
+                            calls_limit        INTEGER DEFAULT 100,
+                            stripe_customer_id TEXT,
+                            stripe_sub_id      TEXT,
+                            created_at         REAL NOT NULL,
+                            active             INTEGER DEFAULT 1,
+                            email              TEXT DEFAULT ''
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS call_log (
+                            id         SERIAL PRIMARY KEY,
+                            ts         REAL NOT NULL,
+                            key_prefix TEXT NOT NULL,
+                            tool       TEXT NOT NULL,
+                            status     INTEGER DEFAULT 200,
+                            latency_ms REAL
+                        )
+                    """)
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_key ON call_log(key_prefix)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_ts  ON call_log(ts)")
+        return _pg_conn
+    # SQLite fallback for local dev
     if not hasattr(_local, "conn"):
         _local.conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         _local.conn.row_factory = sqlite3.Row
@@ -100,24 +149,26 @@ def generate_key() -> str:
     return "aw_" + uuid.uuid4().hex
 
 def get_key_record(raw_key: str):
-    db  = get_db()
-    h   = hash_key(raw_key)
-    row = db.execute(
-        "SELECT * FROM api_keys WHERE key_hash=? AND active=1", (h,)
-    ).fetchone()
-    return row
+    db = get_db()
+    h  = hash_key(raw_key)
+    if DATABASE_URL and HAS_PG:
+        with db.cursor() as cur:
+            cur.execute("SELECT * FROM api_keys WHERE key_hash=%s AND active=1", (h,))
+            return cur.fetchone()
+    return db.execute("SELECT * FROM api_keys WHERE key_hash=? AND active=1", (h,)).fetchone()
 
 def increment_calls(key_prefix: str, tool: str, status: int, latency: float):
     db = get_db()
-    db.execute(
-        "UPDATE api_keys SET calls_used = calls_used + 1 WHERE key_prefix=?",
-        (key_prefix,)
-    )
-    db.execute(
-        "INSERT INTO call_log (ts, key_prefix, tool, status, latency_ms) VALUES (?,?,?,?,?)",
-        (time.time(), key_prefix, tool, status, latency)
-    )
-    db.commit()
+    if DATABASE_URL and HAS_PG:
+        with db.cursor() as cur:
+            cur.execute("UPDATE api_keys SET calls_used = calls_used + 1 WHERE key_prefix=%s", (key_prefix,))
+            cur.execute("INSERT INTO call_log (ts, key_prefix, tool, status, latency_ms) VALUES (%s,%s,%s,%s,%s)",
+                        (time.time(), key_prefix, tool, status, latency))
+    else:
+        db.execute("UPDATE api_keys SET calls_used = calls_used + 1 WHERE key_prefix=?", (key_prefix,))
+        db.execute("INSERT INTO call_log (ts, key_prefix, tool, status, latency_ms) VALUES (?,?,?,?,?)",
+                   (time.time(), key_prefix, tool, status, latency))
+        db.commit()
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -162,19 +213,28 @@ async def call_anthropic(system: str, prompt: str, max_tokens: int = 800) -> str
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_db()
-    # Seed a free dev key for testing
     db = get_db()
     test_key = "aw_testkey_dev123"
     h = hash_key(test_key)
-    exists = db.execute("SELECT key_hash FROM api_keys WHERE key_hash=?", (h,)).fetchone()
-    if not exists:
-        db.execute(
-            "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email) VALUES (?,?,?,?,?,?)",
-            (h, "aw_testk", "free", 100, time.time(), "dev@agentwell.dev")
-        )
-        db.commit()
-        print(f"Dev test key: {test_key}")
+    if DATABASE_URL and HAS_PG:
+        with db.cursor() as cur:
+            cur.execute("SELECT key_hash FROM api_keys WHERE key_hash=%s", (h,))
+            exists = cur.fetchone()
+            if not exists:
+                cur.execute(
+                    "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (h, "aw_testk", "free", 100, time.time(), "dev@agentwell.dev")
+                )
+        print(f"Postgres connected. Dev test key: {test_key}")
+    else:
+        exists = db.execute("SELECT key_hash FROM api_keys WHERE key_hash=?", (h,)).fetchone()
+        if not exists:
+            db.execute(
+                "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email) VALUES (?,?,?,?,?,?)",
+                (h, "aw_testk", "free", 100, time.time(), "dev@agentwell.dev")
+            )
+            db.commit()
+        print(f"SQLite mode. Dev test key: {test_key}")
     yield
 
 app = FastAPI(
@@ -556,10 +616,12 @@ async def key_status(record=Depends(require_key)):
     """Check your key's usage and plan."""
     plan   = PLANS.get(record["plan"], PLANS["free"])
     db     = get_db()
-    recent = db.execute(
-        "SELECT tool, COUNT(*) as n FROM call_log WHERE key_prefix=? GROUP BY tool",
-        (record["key_prefix"],)
-    ).fetchall()
+    if DATABASE_URL and HAS_PG:
+        with db.cursor() as cur:
+            cur.execute("SELECT tool, COUNT(*) as n FROM call_log WHERE key_prefix=%s GROUP BY tool", (record["key_prefix"],))
+            recent = cur.fetchall()
+    else:
+        recent = db.execute("SELECT tool, COUNT(*) as n FROM call_log WHERE key_prefix=? GROUP BY tool", (record["key_prefix"],)).fetchall()
     return {
         "plan":         record["plan"],
         "calls_used":   record["calls_used"],
@@ -589,19 +651,30 @@ async def stripe_webhook(request: Request):
         h          = hash_key(raw_key)
         prefix     = raw_key[:10]
         limit      = PLANS.get(plan, PLANS["dev"])["calls_per_month"]
-        db         = get_db()
-        db.execute(
-            "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email, stripe_customer_id) VALUES (?,?,?,?,?,?,?)",
-            (h, prefix, plan, limit, time.time(), email, customer)
-        )
-        db.commit()
+        db = get_db()
+        if DATABASE_URL and HAS_PG:
+            with db.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email, stripe_customer_id) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                    (h, prefix, plan, limit, time.time(), email, customer)
+                )
+        else:
+            db.execute(
+                "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email, stripe_customer_id) VALUES (?,?,?,?,?,?,?)",
+                (h, prefix, plan, limit, time.time(), email, customer)
+            )
+            db.commit()
         print(f"New key created for {email} ({plan}): {raw_key}")
 
     elif event["type"] == "customer.subscription.deleted":
         customer = event["data"]["object"].get("customer","")
-        db       = get_db()
-        db.execute("UPDATE api_keys SET active=0 WHERE stripe_customer_id=?", (customer,))
-        db.commit()
+        db = get_db()
+        if DATABASE_URL and HAS_PG:
+            with db.cursor() as cur:
+                cur.execute("UPDATE api_keys SET active=0 WHERE stripe_customer_id=%s", (customer,))
+        else:
+            db.execute("UPDATE api_keys SET active=0 WHERE stripe_customer_id=?", (customer,))
+            db.commit()
 
     return {"status": "ok"}
 
