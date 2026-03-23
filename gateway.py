@@ -676,3 +676,46 @@ async def server_card():
         "auth": {"type": "bearer", "header": "X-API-Key"},
         "contact": "https://github.com/metafiopy-tech/agentwell"
     }
+
+@app.post("/mcp")
+async def mcp_protocol(request: Request):
+    body = await request.json()
+    method = body.get("method", "")
+    req_id = body.get("id", 1)
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "AgentWell", "version": "1.0.0"}
+            }
+        }
+
+    if method == "tools/list":
+        return {
+            "jsonrpc": "2.0", "id": req_id,
+            "result": {"tools": [
+                {"name": "token_offload", "description": "Mid-run context offloading. Park heavy context, get a key, retrieve later.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "content": {"type": "string"}, "key": {"type": "string"}}}},
+                {"name": "self_eval", "description": "Rate last N outputs for quality drift before it compounds.", "inputSchema": {"type": "object", "properties": {"outputs": {"type": "array"}, "goal": {"type": "string"}}}},
+                {"name": "ground", "description": "Confidence injection. Breaks hallucination spirals mid-run.", "inputSchema": {"type": "object", "properties": {"context": {"type": "string"}, "symptoms": {"type": "array"}}}},
+                {"name": "sleep", "description": "Episodic to semantic memory consolidation.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "run_id": {"type": "string"}, "content": {"type": "string"}}}},
+                {"name": "health_check", "description": "Benchmark probes and anomaly detection.", "inputSchema": {"type": "object", "properties": {"agent_id": {"type": "string"}}}},
+                {"name": "audit", "description": "Adversarial blind spot scanner. Red-teams your own reasoning.", "inputSchema": {"type": "object", "properties": {"reasoning": {"type": "string"}}}},
+                {"name": "handshake", "description": "Multi-agent context sync.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "token": {"type": "string"}, "agent_id": {"type": "string"}, "context": {"type": "string"}}}},
+                {"name": "journal", "description": "Structured run logging with replay and lesson extraction.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "run_id": {"type": "string"}, "content": {"type": "string"}}}},
+                {"name": "spike", "description": "Controlled temperature burst to escape output loops.", "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}, "prompt": {"type": "string"}, "intensity": {"type": "string"}}}}
+            ]}
+        }
+
+    if method == "tools/call":
+        tool = body.get("params", {}).get("name", "")
+        params = body.get("params", {}).get("arguments", {})
+        try:
+            result = await _dispatch(tool, params)
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
+        except Exception as e:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}}
+
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
