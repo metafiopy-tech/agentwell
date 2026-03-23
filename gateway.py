@@ -589,12 +589,12 @@ async def create_key(req: CreateKeyRequest, _=Depends(require_admin)):
     h       = hash_key(raw_key)
     prefix  = raw_key[:10]
     limit   = PLANS[req.plan]["calls_per_month"]
-    db      = get_db()
-    db.execute(
-        "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email) VALUES (?,?,?,?,?,?)",
-        (h, prefix, req.plan, limit, time.time(), req.email)
-    )
-    db.commit()
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO api_keys (key_hash, key_prefix, plan, calls_limit, created_at, email) VALUES (%s,%s,%s,%s,%s,%s)",
+            (h, prefix, req.plan, limit, time.time(), req.email)
+        )
     return {"api_key": raw_key, "prefix": prefix, "plan": req.plan,
             "calls_limit": limit, "email": req.email,
             "warning": "Store this key — it cannot be recovered"}
