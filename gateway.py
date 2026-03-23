@@ -62,7 +62,8 @@ PLANS = {
 
 TOOLS = [
     "token_offload", "self_eval", "ground", "sleep",
-    "health_check", "audit", "handshake", "journal", "spike"
+    "health_check", "audit", "handshake", "journal", "spike",
+    "checkpoint", "risk_register"
 ]
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -308,20 +309,53 @@ async def _dispatch(tool: str, params: dict) -> dict:
             return _token_status()
 
     elif tool == "self_eval":
-        outputs = params.get("outputs", [])
-        goal    = params.get("goal", "")
+        outputs  = params.get("outputs", [])
+        goal     = params.get("goal", "")
+        history  = params.get("history", "")   # optional: prior steps summary
+        mode     = params.get("mode", "auto")  # "pair" | "step" | "auto"
         if not outputs:
             return {"error": "outputs required"}
-        prompt = f"""Rate these {len(outputs)} agent outputs. Goal: {goal or 'unspecified'}
+
+        # Auto-detect mode: single output = score_step, multiple = pair eval
+        if mode == "auto":
+            mode = "step" if len(outputs) == 1 else "pair"
+
+        if mode == "step":
+            # Score a single step against the full goal + run history
+            step_text = outputs[0]
+            history_line = f"\nPrior steps summary: {history[:600]}" if history else ""
+            prompt = f"""You are evaluating a single step in a multi-step agent run.
+Goal: {goal or 'unspecified'}{history_line}
+
+This step's output:
+{step_text[:800]}
+
+Score this step. Respond ONLY with JSON:
+{{"confidence": 0.0-1.0,
+  "is_solid": bool,
+  "weakness": "one sentence — the specific gap in this step, or null if solid",
+  "flags": ["list of specific concerns, empty if none"],
+  "recommendation": "continue|recalibrate|stop",
+  "note": "one sentence of actionable guidance for the next step"}}"""
+            raw    = await call_anthropic("You are a precise step-level quality evaluator for AI agents. Be harsh. A solid step earns 0.8+. Flag vague outputs, missing methodology, and unsupported claims.", prompt, 250)
+            result = _parse_json(raw)
+            result["mode"] = "step"
+            result["weakest"] = result.get("weakness")
+            return result
+        else:
+            # Original pair evaluation — good for comparing finished outputs
+            numbered = chr(10).join(f"[{i+1}] {o}" for i,o in enumerate(outputs))
+            prompt = f"""Rate these {len(outputs)} agent outputs side by side. Goal: {goal or 'unspecified'}
 Outputs:
-{chr(10).join(f'[{i+1}] {o}' for i,o in enumerate(outputs))}
+{numbered[:1200]}
 Respond ONLY with JSON: {{"confidence": 0.0-1.0, "weakest_index": int, "weakest_reason": "str", "flags": [], "recommendation": "continue|recalibrate|stop"}}"""
-        raw    = await call_anthropic("You are a ruthless quality evaluator.", prompt, 300)
-        result = _parse_json(raw)
-        idx    = result.get("weakest_index", 1)
-        reason = result.get("weakest_reason", "")
-        result["weakest"] = f"Output [{idx}]: {reason}" if reason else None
-        return result
+            raw    = await call_anthropic("You are a ruthless quality evaluator.", prompt, 300)
+            result = _parse_json(raw)
+            idx    = result.get("weakest_index", 1)
+            reason = result.get("weakest_reason", "")
+            result["weakest"] = f"Output [{idx}]: {reason}" if reason else None
+            result["mode"] = "pair"
+            return result
 
     elif tool == "ground":
         context  = params.get("context", "")
@@ -349,15 +383,40 @@ Respond ONLY with JSON: {{"spiral_score": 0.0-1.0, "diagnosis": "str", "groundin
 
     elif tool == "audit":
         reasoning = params.get("reasoning", "")
+        goal      = params.get("goal", "")
         if not reasoning:
             return {"error": "reasoning required"}
-        prompt = f"""Red-team this agent reasoning:
+        # Truncate input cleanly — 2000 chars max to prevent response truncation
+        MAX_INPUT = 2000
+        if len(reasoning) > MAX_INPUT:
+            reasoning_truncated = reasoning[:MAX_INPUT] + "\n[...truncated for audit — consider splitting into sections]"
+            was_truncated = True
+        else:
+            reasoning_truncated = reasoning
+            was_truncated = False
+        goal_line = f"\nGoal: {goal}" if goal else ""
+        prompt = f"""Red-team this agent reasoning. Find every flaw.{goal_line}
+
+Reasoning:
 ---
-{reasoning[:1200]}
+{reasoning_truncated}
 ---
-Respond ONLY with JSON: {{"vulnerabilities": [{{"type": "str", "description": "str", "severity": "low|medium|high|critical"}}], "strongest_challenge": "str", "overall_severity": "str", "safe_to_proceed": bool, "recommendations": []}}"""
-        raw = await call_anthropic("You are a ruthless adversarial auditor.", prompt, 600)
-        return _parse_json(raw)
+
+Respond ONLY with valid JSON — keep all string values under 150 chars:
+{{"vulnerabilities": [{{"type": "assumption|logic_gap|missing_info|overconfidence|scope_creep|other", "description": "str max 120 chars", "severity": "low|medium|high|critical"}}], "strongest_challenge": "str max 200 chars", "overall_severity": "low|medium|high|critical", "safe_to_proceed": bool, "recommendations": ["str max 100 chars each"]}}"""
+        try:
+            raw    = await call_anthropic("You are a ruthless adversarial auditor. Find what's wrong. Respond ONLY with valid compact JSON.", prompt, 800)
+            result = _parse_json(raw)
+            if was_truncated:
+                result["warning"] = f"Input was truncated from {len(params.get('reasoning',''))} to {MAX_INPUT} chars. For full audit, split reasoning into sections."
+            return result
+        except Exception as e:
+            return {
+                "error": "audit_failed",
+                "message": str(e),
+                "hint": "If you see JSONDecodeError, your input may be too long. Try splitting reasoning into sections under 1500 chars each.",
+                "safe_to_proceed": False
+            }
 
     elif tool == "handshake":
         action = params.get("action", "offer")
@@ -385,6 +444,96 @@ Respond ONLY with JSON: {{"vulnerabilities": [{{"type": "str", "description": "s
             return _spike_detect(params)
         elif action == "burst":
             return await _spike_burst(params)
+
+    elif tool == "checkpoint":
+        findings  = params.get("findings", [])
+        run_id    = params.get("run_id", "")
+        step      = params.get("step", "")
+        if not findings:
+            return {"error": "findings required — pass audit vulnerabilities or self_eval flags"}
+        # Filter to actionable items only
+        blockers = [f for f in findings if isinstance(f, dict) and f.get("severity") in ("high", "critical")]
+        warnings = [f for f in findings if isinstance(f, dict) and f.get("severity") in ("low", "medium")]
+        if not blockers:
+            return {
+                "gate": "pass",
+                "message": "No blockers found. Safe to continue.",
+                "warnings": [w.get("description", str(w)) for w in warnings],
+                "must_address": [],
+                "step": step
+            }
+        must_address = [
+            {
+                "issue": b.get("description", str(b)),
+                "severity": b.get("severity", "high"),
+                "action": f"Address before continuing past step: {step}"
+            }
+            for b in blockers
+        ]
+        return {
+            "gate": "blocked",
+            "message": f"{len(blockers)} blocker(s) must be addressed before continuing.",
+            "must_address": must_address,
+            "warnings": [w.get("description", str(w)) for w in warnings],
+            "step": step,
+            "run_id": run_id
+        }
+
+    elif tool == "risk_register":
+        action = params.get("action", "log")
+        run_id = params.get("run_id", "default")
+        db     = _get_tool_db("risk_register")
+        db.execute("""CREATE TABLE IF NOT EXISTS risks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL, run_id TEXT, flag TEXT,
+            source TEXT, step TEXT, count INTEGER DEFAULT 1
+        )""")
+        db.commit()
+
+        if action == "log":
+            flags  = params.get("flags", [])
+            source = params.get("source", "self_eval")
+            step   = params.get("step", "")
+            if not flags:
+                return {"error": "flags required"}
+            logged = []
+            for flag in flags:
+                existing = db.execute(
+                    "SELECT id, count FROM risks WHERE run_id=? AND flag=?",
+                    (run_id, flag)
+                ).fetchone()
+                if existing:
+                    db.execute("UPDATE risks SET count=count+1, step=? WHERE id=?", (step, existing["id"]))
+                    logged.append({"flag": flag, "count": existing["count"] + 1, "status": "incremented"})
+                else:
+                    db.execute("INSERT INTO risks (ts, run_id, flag, source, step) VALUES (?,?,?,?,?)",
+                               (time.time(), run_id, flag, source, step))
+                    logged.append({"flag": flag, "count": 1, "status": "new"})
+            db.commit()
+            return {"logged": logged, "run_id": run_id}
+
+        elif action == "summary":
+            rows = db.execute(
+                "SELECT flag, source, count, step FROM risks WHERE run_id=? ORDER BY count DESC",
+                (run_id,)
+            ).fetchall()
+            systemic = [dict(r) for r in rows if r["count"] >= 3]
+            occasional = [dict(r) for r in rows if r["count"] < 3]
+            return {
+                "run_id":    run_id,
+                "total_flags": sum(r["count"] for r in rows),
+                "unique_flags": len(rows),
+                "systemic":  systemic,
+                "occasional": occasional,
+                "message": f"{len(systemic)} systemic issue(s) flagged 3+ times — these are plan-level problems, not step-level noise." if systemic else "No systemic issues detected."
+            }
+
+        elif action == "clear":
+            db.execute("DELETE FROM risks WHERE run_id=?", (run_id,))
+            db.commit()
+            return {"cleared": True, "run_id": run_id}
+
+        return {"error": f"Unknown risk_register action: {action}"}
 
     return {"error": f"Unknown action for tool '{tool}'"}
 
@@ -472,8 +621,11 @@ def _sleep_wake(params):
     db   = _get_tool_db("sleep")
     db.execute("CREATE TABLE IF NOT EXISTS semantic (id INTEGER PRIMARY KEY, ts REAL, run_id TEXT, tags TEXT, content TEXT)")
     rows = db.execute("SELECT content, tags FROM semantic ORDER BY ts DESC LIMIT 5").fetchall()
-    block = "Prior memory:\n" + "\n---\n".join(r["content"] for r in rows) if rows else ""
-    return {"memories": [dict(r) for r in rows], "context_block": block}
+    if not rows:
+        return {"memories": [], "context_block": "", "status": "no_prior_memory", "skip": True,
+                "message": "No prior memory found. Proceed directly — no need to call wake again this session."}
+    block = "Prior memory:\n" + "\n---\n".join(r["content"] for r in rows)
+    return {"memories": [dict(r) for r in rows], "context_block": block, "status": "memory_found", "count": len(rows)}
 
 async def _run_health_check(agent_id: str):
     probes = [
