@@ -232,6 +232,27 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={
+        "error": "validation_error",
+        "message": "Invalid request format",
+        "details": exc.errors(),
+        "support": "github.com/metafiopy-tech/agentwell/issues"
+    })
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={
+        "error": "internal_error",
+        "message": "Something went wrong. Please try again.",
+        "type": type(exc).__name__,
+        "support": "github.com/metafiopy-tech/agentwell/issues"
+    })
+
 # ── Tool endpoints ────────────────────────────────────────────────────────────
 
 class ToolRequest(BaseModel):
@@ -257,10 +278,19 @@ async def call_tool(req: ToolRequest, record=Depends(require_key)):
         increment_calls(key_prefix, req.tool, 200, latency)
         return {"tool": req.tool, "result": result, "latency_ms": round(latency, 1)}
 
+    except HTTPException:
+        raise
     except Exception as e:
         latency = (time.time() - start) * 1000
         increment_calls(key_prefix, req.tool, 500, latency)
-        raise HTTPException(500, f"Tool error: {str(e)}")
+        error_type = type(e).__name__
+        raise HTTPException(500, {
+            "error": "tool_error",
+            "tool": req.tool,
+            "message": str(e),
+            "type": error_type,
+            "support": "github.com/metafiopy-tech/agentwell/issues"
+        })
 
 
 async def _dispatch(tool: str, params: dict) -> dict:
@@ -286,8 +316,12 @@ async def _dispatch(tool: str, params: dict) -> dict:
 Outputs:
 {chr(10).join(f'[{i+1}] {o}' for i,o in enumerate(outputs))}
 Respond ONLY with JSON: {{"confidence": 0.0-1.0, "weakest_index": int, "weakest_reason": "str", "flags": [], "recommendation": "continue|recalibrate|stop"}}"""
-        raw = await call_anthropic("You are a ruthless quality evaluator.", prompt, 300)
-        return _parse_json(raw)
+        raw    = await call_anthropic("You are a ruthless quality evaluator.", prompt, 300)
+        result = _parse_json(raw)
+        idx    = result.get("weakest_index", 1)
+        reason = result.get("weakest_reason", "")
+        result["weakest"] = f"Output [{idx}]: {reason}" if reason else None
+        return result
 
     elif tool == "ground":
         context  = params.get("context", "")
