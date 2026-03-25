@@ -229,7 +229,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AgentWell API",
     description="Cognitive wellness infrastructure for AI agents. One key, nine tools, growing library.",
-    version="2.0.0",
+    version="2.0.1",
     lifespan=lifespan
 )
 
