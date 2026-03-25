@@ -63,7 +63,9 @@ PLANS = {
 TOOLS = [
     "token_offload", "self_eval", "ground", "sleep",
     "health_check", "audit", "handshake", "journal", "spike",
-    "checkpoint", "risk_register"
+    "checkpoint", "risk_register",
+    "coherence_restore", "cost_guard", "intent_verify",
+    "ocean", "polarity_sync", "proposal_eval", "rollback"
 ]
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -229,7 +231,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AgentWell API",
     description="Cognitive wellness infrastructure for AI agents. One key, nine tools, growing library.",
-    version="2.0.1",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -1411,7 +1413,7 @@ async def stripe_webhook(request: Request):
 async def root():
     return {
         "name":        "AgentWell API",
-        "version":     "1.0.0",
+        "version":     "2.0.0",
         "tools":       TOOLS,
         "plans":       PLANS,
         "docs":        "/docs",
@@ -1439,4 +1441,3 @@ async def list_tools():
         ],
         "count": len(TOOLS)
     }
-
