@@ -987,13 +987,26 @@ Respond ONLY with JSON: {{"is_code_change":bool,"blast_radius":"low|medium|high|
 def _proposal_quick_filter(params):
     combined = (params.get("title","")+params.get("what","")+params.get("why","")).lower()
     non_code = [s for s in NON_CODE_SIGNALS_PE if s in combined]
-    code_sigs = ["error","bug","function","class","import","test","fix","implement","refactor"]
+    code_sigs = ["error","bug","function","class","import","test","fix","implement","refactor",
+                 "adopt","architecture","system","agent","deploy","build","add","change","update","improve"]
     code_hits = [s for s in code_sigs if s in combined]
     non_score = min(len(non_code)/4.0,1.0)
     code_score = min(len(code_hits)/5.0,1.0)
-    return {"likely_valid":code_score>non_score and non_score<0.4,"non_code_score":round(non_score,3),
-            "code_score":round(code_score,3),"flags":[f"Non-code: {','.join(non_code[:3])}"] if non_score>=0.4 else [],
-            "recommend_full_eval":non_score>0.2}
+    # Sparse input: if combined text is under 20 words, default to recommend full eval
+    word_count = len(combined.split())
+    is_sparse = word_count < 20
+    likely_valid = code_score >= non_score and non_score < 0.4 and not (non_code and not code_hits)
+    flags = []
+    if non_score >= 0.4:
+        flags.append(f"Non-code signals: {', '.join(non_code[:3])}")
+    if is_sparse:
+        flags.append("Input too sparse for reliable filtering — use full evaluate()")
+    return {"likely_valid":likely_valid and not is_sparse,
+            "non_code_score":round(non_score,3),
+            "code_score":round(code_score,3),
+            "flags":flags,
+            "recommend_full_eval": is_sparse or non_score > 0.2 or not likely_valid,
+            "note": "Input was sparse — quick_filter requires more detail. Use evaluate() for reliable results." if is_sparse else None}
 
 def _proposal_record_outcome(params):
     db = _new_tool_db("proposal_eval")
@@ -1017,9 +1030,12 @@ def _rollback_snapshot(params):
     paths = params.get("paths",[])
     snapped = []
     total_sz = 0
+    missing = []
     for path_str in paths:
         path = Path(path_str).expanduser()
-        if not path.exists(): continue
+        if not path.exists():
+            missing.append(str(path))
+            continue
         if path.is_file():
             dest = snap_dir / path.name
             _shutil.copy2(path, dest)
@@ -1034,7 +1050,14 @@ def _rollback_snapshot(params):
     db.execute("INSERT INTO snapshots (ts,snapshot_id,agent_id,label,paths,snapshot_dir) VALUES (?,?,?,?,?,?)",
                (time.time(),snap_id,params.get("agent_id",""),params.get("label",""),json.dumps(snapped),str(snap_dir)))
     db.commit()
-    return {"snapshot_id":snap_id,"files_snapped":len(snapped),"paths":snapped,"size_bytes":total_sz}
+    result = {"snapshot_id":snap_id,"files_snapped":len(snapped),"paths":snapped,"size_bytes":total_sz}
+    if missing:
+        result["warning"] = f"{len(missing)} path(s) not found and were skipped: {missing}"
+        result["note"] = "Snapshot created but some paths were missing. Only existing paths are snapshotted."
+    if not snapped:
+        result["warning"] = "No files were snapped — all provided paths were missing or empty."
+        result["usable"] = False
+    return result
 
 def _rollback_restore(params):
     snap_id = params.get("snapshot_id","")
